@@ -1,135 +1,230 @@
 import streamlit as st
 import pandas as pd
+import scipy.stats as stats
+import matplotlib.pyplot as plt
 import numpy as np
+from datetime import datetime
+import io
 
-st.set_page_config(page_title="Forensic Lab Suite", page_icon="⚖️", layout="wide")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="Forensic Lab Suite PRO", layout="wide")
 
-# --- STYLE ---
-st.markdown("""
-    <style>
-    .main { background-color: #f5f7f9; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    </style>
-    """, unsafe_view_safe_base64=True)
+# --- SHARED SESSION STATE ---
+if 'unknowns_results' not in st.session_state:
+    st.session_state['unknowns_results'] = []
+if 'curve_calculated' not in st.session_state:
+    st.session_state['curve_calculated'] = False
 
-tab1, tab2 = st.tabs(["📉 QUANTIFICATION (GC-FID/MS)", "🔬 IDENTIFICATION (MS Isotope Tracker)"])
+# --- TABS SETUP ---
+tab1, tab2 = st.tabs(["📉 Quantification (GC-FID/MS)", "🔬 Identification (MS Isotopes)"])
 
-# --- TAB 1: FULL GC QUANTIFICATION ENGINE ---
+# ==========================================
+# TAB 1: CHROMATOGRAPHY (QUANTIFICATION)
+# ==========================================
 with tab1:
-    st.header("Quantitative Analysis & Calibration")
+    st.header("1. Method Parameters")
     
-    with st.expander("🛠️ Calibration Curve Setup (Internal Standard Mode)", expanded=True):
-        col_input1, col_input2 = st.columns(2)
-        with col_input1:
-            concs_raw = st.text_input("Standard Concentrations [mg/mL]:", "5, 10, 20, 40, 60")
-        with col_input2:
-            ratios_raw = st.text_input("Area Ratios (Area Target / Area IS):", "0.45, 0.92, 1.85, 3.65, 5.50")
+    col1, col2 = st.columns(2)
+    with col1:
+        stock_unit = st.text_input("Stock concentration unit (e.g., mg/L)", value="mg/L")
+        target_unit = st.text_input("Standard concentration unit (e.g., ug/mL)", value="ug/mL")
+        vol_unit = st.text_input("Volume unit (e.g., mL)", value="mL")
+    with col2:
+        C1_raw = st.number_input(f"Stock Concentration ({stock_unit})", value=100.0)
+        V2 = st.number_input(f"Final Standard Volume ({vol_unit})", value=10.0)
+        c2_input = st.text_input("Standard Concentrations (comma separated)", value="0.1, 0.5, 1.0, 2.0, 5.0")
+
+    st.markdown("### Internal Standard (IS)")
+    use_is = st.checkbox("Use Internal Standard (IS)", value=True)
+    if use_is:
+        col_is1, col_is2 = st.columns(2)
+        with col_is1:
+            is_vol = st.number_input("IS Volume added to vial", value=10.0)
+        with col_is2:
+            is_unit = st.text_input("IS volume unit (e.g., uL)", value="uL")
+    else:
+        is_vol = 0.0
+        is_unit = ""
+
+    # --- Unit Conversion Logic ---
+    unit_factors = {'ug/ml': 1.0, 'mg/l': 1.0, 'ppm': 1.0, 'mg/ml': 1000.0, 'g/l': 1000.0, 'ug/l': 0.001, 'ng/ml': 0.001, 'ppb': 0.001}
+    s_unit_clean = stock_unit.lower().replace(" ", "")
+    t_unit_clean = target_unit.lower().replace(" ", "")
+    multiplier = unit_factors.get(s_unit_clean, 1.0) / unit_factors.get(t_unit_clean, 1.0)
+    C1_converted = C1_raw * multiplier
+
+    c2_list = [float(x.strip()) for x in c2_input.split(",") if x.strip()]
+    v1_list = [(c * V2) / C1_converted for c in c2_list]
+
+    # --- Pipetting Instructions ---
+    st.header("2. Pipetting Instructions")
+    pipette_dict = {
+        f"Conc ({target_unit})": c2_list,
+        f"Stock Volume ({vol_unit})": [round(v, 4) for v in v1_list]
+    }
+    if use_is:
+        pipette_dict[f"Add IS ({is_unit})"] = [is_vol] * len(c2_list)
+    pipette_dict[f"Fill up to ({vol_unit})"] = [V2] * len(c2_list)
+    st.table(pd.DataFrame(pipette_dict))
+
+    # --- Data Entry ---
+    st.header("3. Chromatographic Data")
+    if use_is:
+        entry_df = pd.DataFrame({
+            f"Standard ({target_unit})": c2_list, 
+            "Peak Area (Analyte)": [0.0] * len(c2_list),
+            "Peak Area (IS)": [0.0] * len(c2_list)
+        })
+    else:
+        entry_df = pd.DataFrame({
+            f"Standard ({target_unit})": c2_list, 
+            "Peak Area": [0.0] * len(c2_list)
+        })
+
+    edited_df = st.data_editor(entry_df, use_container_width=True)
+
+    if st.button("Calculate Calibration Curve", type="primary"):
+        if use_is:
+            std_areas = edited_df["Peak Area (Analyte)"].tolist()
+            is_areas = edited_df["Peak Area (IS)"].tolist()
+            y_vals = [s / i if i > 0 else 0 for s, i in zip(std_areas, is_areas)]
+            st.session_state['std_areas_data'] = std_areas
+            st.session_state['is_areas_data'] = is_areas
+            st.session_state['ratios_data'] = y_vals
+        else:
+            y_vals = edited_df["Peak Area"].tolist()
+            st.session_state['y_vals_data'] = y_vals
+
+        slope, intercept, r_value, p_value, std_err = stats.linregress(c2_list, y_vals)
+        st.session_state['slope'] = slope
+        st.session_state['intercept'] = intercept
+        st.session_state['r2'] = r_value**2
+        st.session_state['curve_has_is'] = use_is 
+        st.session_state['c2_list_data'] = c2_list
+        st.session_state['y_plot_data'] = y_vals
+        st.session_state['curve_calculated'] = True
+
+    # --- Curve Visualization ---
+    if st.session_state.get('curve_calculated', False):
+        st.success(f"**Equation:** y = {st.session_state['slope']:.4f}x + {st.session_state['intercept']:.4f} | **R²** = {st.session_state['r2']:.4f}")
         
-        try:
-            x_cal = np.fromstring(concs_raw, sep=',')
-            y_cal = np.fromstring(ratios_raw, sep=',')
-            if len(x_cal) == len(y_cal) and len(x_cal) > 1:
-                slope, intercept = np.polyfit(x_cal, y_cal, 1)
-                r_squared = np.corrcoef(x_cal, y_cal)[0,1]**2
-                st.success(f"Curve Ready: **y = {slope:.4f}x + {intercept:.4f}** (R² = {r_squared:.4f})")
-            else:
-                st.warning("Awaiting valid data points...")
-        except:
-            st.error("Check data format (use commas to separate numbers)")
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.scatter(st.session_state['c2_list_data'], st.session_state['y_plot_data'], color='red', label='Calibration Points')
+        ax.plot(st.session_state['c2_list_data'], [st.session_state['slope']*x + st.session_state['intercept'] for x in st.session_state['c2_list_data']], color='blue', label='Trendline')
+        ax.set_xlabel(f"Concentration ({target_unit})")
+        ax.set_ylabel("Ratio (Analyte/IS)" if st.session_state['curve_has_is'] else "Peak Area")
+        ax.legend()
+        st.pyplot(fig)
 
-    st.subheader("🧪 Sample Analysis")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        sample_area = st.number_input("Analyte Peak Area (Sample):", value=5200.0)
-    with c2:
-        is_area = st.number_input("Internal Standard Area (Sample):", value=1500.0)
-    with c3:
-        dilution = st.number_input("Dilution Factor:", value=1.0)
+    # --- Sample Analysis ---
+    st.header("4. Sample Analysis")
+    if st.session_state.get('curve_calculated', False):
+        cu1, cu2, cu3 = st.columns(3)
+        with cu1: unk_name = st.text_input("Sample Name:", value="Sample 1")
+        with cu2: unk_area = st.number_input("Analyte Peak Area:", value=0.0)
+        with cu3: unk_is_area = st.number_input("IS Peak Area (in Sample):", value=1.0) if st.session_state['curve_has_is'] else 1.0
 
-    if st.button("Calculate Concentration", key="calc_btn"):
-        sample_ratio = sample_area / is_area
-        # x = (y - b) / m
-        conc_result = ((sample_ratio - intercept) / slope) * dilution
+        if st.button("Add to Report"):
+            y_for_calc = unk_area / unk_is_area if st.session_state['curve_has_is'] else unk_area
+            res = (y_for_calc - st.session_state['intercept']) / st.session_state['slope']
+            st.session_state['unknowns_results'].append({
+                "Name": unk_name,
+                "Area": unk_area, 
+                "Ratio": round(y_for_calc, 4),
+                f"Result ({target_unit})": round(res, 4),
+                "Time": datetime.now().strftime('%H:%M:%S')
+            })
         
-        st.divider()
-        res_col1, res_col2 = st.columns(2)
-        res_col1.metric("Calculated Concentration", f"{conc_result:.3f} mg/mL")
-        res_col2.metric("Area Ratio", f"{sample_ratio:.3f}")
+        if st.session_state['unknowns_results']:
+            st.table(pd.DataFrame(st.session_state['unknowns_results']))
+            
+            # --- REPORT EXPORT ---
+            st.divider()
+            if st.button("Clear Data"):
+                st.session_state['unknowns_results'] = []
+                st.rerun()
 
-# --- TAB 2: MS IDENTIFICATION ENGINE ---
+# ==========================================
+# TAB 2: MS IDENTIFICATION (ISOTOPES)
+# ==========================================
 with tab2:
-    st.header("Substance Identification & Isotope Pattern")
+    st.header("MS Isotope Analysis & Forensic ID")
     
-    # Forensic context: RT + Mass
-    col_info1, col_info2 = st.columns(2)
-    with col_info1:
-        obs_rt = st.number_input("Observed Retention Time (RT) [min]:", value=8.25, step=0.01)
-    with col_info2:
-        target_mz = st.number_input("Molecular Ion (m/z) of peak M:", value=197.0)
+    # NEW: Retention Time for Forensic Correlation
+    col_id1, col_id2 = st.columns(2)
+    with col_id1:
+        ms_rt = st.number_input("Observed Retention Time (RT) [min]:", value=0.0, step=0.01)
+    with col_id2:
+        mz_m = st.number_input("m/z of peak M (Molecular Ion):", min_value=1.0, value=146.0, step=1.0)
 
     st.divider()
-    st.subheader("Isotope Cluster Data")
-    
-    # Peak Heights for Isotopes
+    st.subheader("Peak Heights (Raw Detector Data)")
     h1, h2, h3, h4, h5 = st.columns(5)
-    with h1: m_h = st.number_input("Height M", value=5200.0)
-    with h2: m1_h = st.number_input("Height M+1", value=620.0)
-    with h3: m2_h = st.number_input("Height M+2", value=1750.0)
-    with h4: m4_h = st.number_input("Height M+4", value=0.0)
-    with h5: m6_h = st.number_input("Height M+6", value=0.0)
+    with h1: peak_m = st.number_input("M", value=8200.0, format="%.1f")
+    with h2: peak_m1 = st.number_input("M+1 (C)", value=550.0, format="%.1f")
+    with h3: peak_m2 = st.number_input("M+2", value=5400.0, format="%.1f") 
+    with h4: peak_m4 = st.number_input("M+4", value=920.0, format="%.1f") 
+    with h5: peak_m6 = st.number_input("M+6", value=0.0, format="%.1f")
 
-    if st.button("Run Forensic Analysis 🚀"):
-        # 1. Normalization
-        m1_pct = (m1_h / m_h) * 100
-        m2_pct = (m2_h / m_h) * 100
-        m4_pct = (m4_h / m_h) * 100
+    if st.button("Analyze Spectrum 🚀"):
+        m_norm = 100.0
+        m1_norm = (peak_m1 / peak_m) * 100.0 if peak_m > 0 else 0.0
+        m2_norm = (peak_m2 / peak_m) * 100.0 if peak_m > 0 else 0.0
+        m4_norm = (peak_m4 / peak_m) * 100.0 if peak_m > 0 else 0.0
+        m6_norm = (peak_m6 / peak_m) * 100.0 if peak_m > 0 else 0.0
         
-        # 2. Logic Engines
-        c_atoms = round(m1_pct / 1.1)
-        
-        st.info(f"**RT Analysis:** Peak detected at **{obs_rt} min**.")
-        st.write(f"**Carbon Estimate:** Found approx. **{c_atoms}** Carbon atoms.")
-
-        # Halogen Detection Logic
-        cl_found, br_found = 0, 0
-        if 25 < m2_pct < 45 and m4_pct < 5:
-            st.warning("🚨 **IDENTIFIED: 1 Chlorine atom (Cl)**")
-            cl_found = 1
-        elif 90 < m2_pct < 110:
-            st.error("🚨 **IDENTIFIED: 1 Bromine atom (Br)**")
-            br_found = 1
-        elif 60 < m2_pct < 80:
-            st.warning("🚨 **IDENTIFIED: 2 Chlorine atoms (Cl2)**")
-            cl_found = 2
-        # ... (more logic can be added here)
-
-        # 3. Nitrogen Rule & Formula Assembly
         st.divider()
-        st.subheader("🧩 Molecular Formula Assembly")
-        
-        # Nitrogen Rule
-        if int(target_mz) % 2 != 0:
-            st.info("💡 **Nitrogen Rule:** Odd mass detected. Likely contains an odd number of Nitrogen atoms.")
-            n_count = 1
-        else:
-            n_count = 0
+        st.subheader("🔍 Identification Results")
+        st.info(f"**RT Match:** Data correlated to peak at **{ms_rt} min**.")
 
-        # Assembly (simplified for forensic hint)
-        known_mass = (c_atoms * 12) + (cl_found * 35) + (br_found * 79) + (n_count * 14)
-        missing = int(target_mz - known_mass)
+        # 1. Carbon Estimation
+        carbon_count = round(m1_norm / 1.1)
+        st.write(f"**Estimated Carbon atoms:** {carbon_count}")
         
-        # Display Formula Hint
-        formula = f"C{c_atoms}"
-        if n_count > 0: formula += f" N{n_count}"
-        if cl_found > 0: formula += f" Cl{cl_found}"
-        if br_found > 0: formula += f" Br{br_found}"
-        if missing > 0: formula += f" (H/O residue: {missing} Da)"
+        # 2. Halogen Logic
+        cl_count, br_count, s_count = 0, 0, 0
+        tol = 10.0 
         
-        st.success(f"**Proposed Skeleton:** {formula}")
+        if abs(m2_norm - 100.0) < tol and abs(m4_norm - 33.0) < tol:
+            st.warning("🚨 **DETECTED: 3 CHLORINE ATOMS (Cl3)**")
+            cl_count = 3
+        elif abs(m2_norm - 200.0) < 15.0 and abs(m4_norm - 100.0) < tol:
+            st.error("🚨 **DETECTED: 2 BROMINE ATOMS (Br2)**")
+            br_count = 2
+        elif abs(m2_norm - 133.0) < 15.0 and abs(m4_norm - 33.0) < tol:
+            st.error("🚨 **DETECTED: 1 CHLORINE + 1 BROMINE**")
+            cl_count, br_count = 1, 1
+        elif abs(m2_norm - 66.0) < tol and abs(m4_norm - 11.0) < 5.0:
+            st.warning("🚨 **DETECTED: 2 CHLORINE ATOMS (Cl2)**")
+            cl_count = 2
+        elif abs(m2_norm - 100.0) < tol:
+            st.error("🚨 **DETECTED: 1 BROMINE ATOM (Br)**")
+            br_count = 1
+        elif abs(m2_norm - 33.0) < tol:
+            st.warning("🚨 **DETECTED: 1 CHLORINE ATOM (Cl)**")
+            cl_count = 1
+        elif abs(m2_norm - 4.4) < 1.0:
+            st.success("⚠️ **DETECTED: SULFUR (S)**")
+            s_count = 1
 
-        # 4. Viz
-        st.subheader("Isotope Visualization")
-        mz_axis = [target_mz, target_mz+1, target_mz+2, target_mz+3, target_mz+4]
-        height_axis = [100.0, m1_pct, m2_pct, 0.0, m4_pct]
-        chart_df = pd.DataFrame({"m/z": mz_axis, "Intensity [%]": height_axis}).set_index("m/z")
-        st.bar_chart(chart_df)
+        # 3. Formula Assembly & Nitrogen Rule
+        st.divider()
+        n_rule_hint = "Odd mass: Likely odd number of Nitrogens." if int(mz_m) % 2 != 0 else "Even mass."
+        st.markdown(f"**Nitrogen Rule:** {n_rule_hint}")
+        
+        identified_mass = (carbon_count*12) + (cl_count*35) + (br_count*79) + (s_count*32)
+        missing = int(mz_m - identified_mass)
+        
+        if missing >= 0:
+            formula = f"C{carbon_count}"
+            if cl_count > 0: formula += f" Cl{cl_count}"
+            if br_count > 0: formula += f" Br{br_count}"
+            if s_count > 0: formula += f" S{s_count}"
+            st.success(f"### Proposed Formula Skeleton: {formula} (Residue: {missing} Da)")
+        
+        # 4. Visualization
+        chart_data = pd.DataFrame({
+            "m/z Offset": ["M", "M+1", "M+2", "M+4", "M+6"],
+            "Intensity [%]": [m_norm, m1_norm, m2_norm, m4_norm, m6_norm]
+        }).set_index("m/z Offset")
+        st.bar_chart(chart_data)
